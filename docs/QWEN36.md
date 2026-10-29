@@ -112,6 +112,58 @@ for bit. The chunk size changes the GEMM tiles the BLAS picks and with them the 
 the size of the llama.cpp CPU-against-HIP difference on the same file, not a quality loss. A prompt shorter than the
 chunk (every chat turn after the first) is one chunk either way.
 
+## A shared prompt prefix
+
+A conversation that starts with the same long system prompt reads those tokens again in every request. A request can
+say that the first N tokens of its prompt are such a prefix:
+
+```
+GEN 64 pin=2420 1234,5678,...
+```
+
+The engine then keeps the state after token N in a checkpoint of its own, and a later request whose prompt starts with
+the same N tokens starts there instead of reading them. Two lines report it: the engine's
+`strata serve: session 0: prompt 2512 tokens = 2420 reused + 92 read in T ms ...` and the `DONE` line's `reused`
+field, which the server hands out as `cached_tokens`.
+
+- The checkpoint is a second copy of the state: the GDN state, the cache's cells below the prefix and the last hidden
+  row. There is one, for one prefix at a time. A `pin=` with other tokens replaces it.
+- It is allocated when the first `pin=` request arrives, out of the VRAM the experts left, and the engine prints its
+  size in MiB then. It is smaller than a session: only the cells below the prefix, not the whole cache.
+- Nothing changes until a request carries `pin=`: the default path, the log and the text are the old ones. `ckpt=0` (the
+  server's one-shot request) keeps no checkpoint, and `--prompt-cache 0` turns the feature off. The server keeps a gate
+  of its own: it sends `pin=` only when `--prompt-cache` is 3 or more, and its default without the flag is 6, so leave
+  the flag out or give it a number of 3 and up. Measured with `--prompt-cache 0`: the server says "the shared start is
+  not kept" and the same three requests read in 6.59 to 6.99 s with 0 cached tokens.
+- A request with pictures keeps no checkpoint, and a prefix that ends inside a picture is not resumed from: a picture's
+  rows are not in the checkpoint.
+- If the checkpoint does not fit in the free VRAM, the engine says so once and goes on without it; the requests are read
+  as before. A full card is not an error.
+- The read of a `pin=` request stops at token N, so the checkpoint is exactly that token. The two parts are one prompt
+  either way and the second part starts from the state a single read reaches.
+
+> **Measured on:** an RTX 5060 Ti 16 GB (CUDA 13.4.92, `sm_120`), Qwen3.6-35B-A3B UD-Q4_K_XL, 65536 cells, 41 of
+> the 256 experts per layer in VRAM and 18.75 GiB of them in host memory. Three captured requests of an AmbuAssist
+> benchmark share a 2420-token system prompt; each was sent twice, with `pin=2420`. The same engine without the pin
+> read them in 6.58 to 6.98 s with 0 cached tokens.
+>
+> | request | prompt tokens | cached | prompt time |
+> | --- | ---: | ---: | ---: |
+> | first, this one writes the checkpoint | 2512 | 0 | 7.60 s |
+> | second | 2585 | 2420 | 3.13 s |
+> | third | 2490 | 2420 | 0.42 s |
+> | first, second round | 2512 | 2420 | 0.46 s |
+> | second, second round | 2585 | 2420 | 3.07 s |
+> | third, second round | 2490 | 2420 | 0.38 s |
+>
+> The checkpoint took 166.8 MiB of the 4.90 GiB of VRAM the experts left, and the engine's line for the 2512-token
+> request was `prompt 2512 tokens = 2420 reused + 92 read in 460 ms`.
+>
+> Two of the three requests read their tail in 0.38 to 0.46 s, 16 times faster than the full read. The 2585-token one
+> takes 3.1 s for its 165 new tokens: 165 is past the 128-row batch that the engine computes on its CPU threads (it
+> prints that limit when it starts), and the streamed expert pass of a bigger chunk costs about 3 s whatever the chunk
+> holds. That is the prompt path's own cost, not the checkpoint's; the same request read in full costs 6.6 s.
+
 ## Speed and exactness
 
 Every change on the decode path gives the old kernels' bits. `STRATA_Q36_VERIFY=1 strata ... --no-graph` runs the old

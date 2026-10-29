@@ -1208,6 +1208,22 @@ struct Engine {
     std::vector<Sess> sess;
     int n_sess = 1, cur = 0;
     uint64_t use_clock = 0;
+    // ---- the pinned prefix (pin=N, opt-in): a copy of the state after the first N tokens of a request, kept beside the
+    // sessions so that the requests that share those tokens (a long system prompt) start there instead of reading them
+    // again.  The recurrent state cannot step back, so the checkpoint is the whole state (the GDN state, the cache's
+    // first N cells, hlast), not an index into the session's.  One prefix at a time; nothing is allocated and no code
+    // path differs until a request asks for one.
+    struct Pin {
+        std::vector<float*> conv, S, kc, vc;   // per state index, as a session's (the MTP block's K / V last)
+        float* hlast = nullptr;
+        int64_t cap = 0;                     // cells the K / V buffers hold: their row pitch (they grow, never shrink)
+        int64_t len = 0;                     // tokens the checkpoint holds (0: none)
+        int32_t rdelta = 0;
+        std::vector<int32_t> live;           // those tokens
+    };
+    Pin pin;
+    int prompt_cache = 1;   // --prompt-cache N: 0 turns the pinned prefix off; this engine keeps one (see pin_save)
+    bool pin_off = false;   // a save did not fit in the free VRAM: the feature stays off (a full card is no error)
     // device tables for batch rows: per state index (layer, then the MTP block) the session pointers
     float **d_conv_tab = nullptr, **d_S_tab = nullptr, **d_kc_tab = nullptr, **d_vc_tab = nullptr;
     int32_t *d_rcell = nullptr, *d_rslot = nullptr, *d_rdelta = nullptr;   // [kVerify] the rows' cell / session / rotary offset
@@ -2678,6 +2694,142 @@ struct Engine {
         b.imgs = a.imgs;
         if (dst == cur) load_cur();
     }
+
+    /// The pinned prefix's buffers: none, then `len` cells' worth (grown when a longer prefix is asked for).  The cost
+    /// is the recurrent state plus the cache cells below the prefix - a few percent of a session, not a session - and it
+    /// comes out of the room the experts left, so a card with none left keeps the feature off instead of ending.
+    bool pin_alloc(int64_t len) {
+        if (pin_off) return false;
+        if (len <= pin.cap) return true;
+        pin_release();
+        const auto& g = m->g;
+        const size_t C = (size_t) g.ssm_conv_channels;
+        bool ok = true;
+        size_t bytes = 0;
+        auto get = [&](size_t n) -> float* {
+            if (!ok) return nullptr;
+            float* p = nullptr;
+            if (cudaMalloc(&p, n * 4) != cudaSuccess) {
+                (void) cudaGetLastError();
+                ok = false;
+                return nullptr;
+            }
+            bytes += n * 4;
+            return p;
+        };
+        for (const Layer& L : m->layers) {
+            if (L.attn) {
+                pin.conv.push_back(nullptr);
+                pin.S.push_back(nullptr);
+                pin.kc.push_back(get((size_t) g.n_head_kv * len * g.head_dim));
+                pin.vc.push_back(get((size_t) g.n_head_kv * len * g.head_dim));
+            } else {
+                pin.conv.push_back(get(C * (g.ssm_d_conv - 1)));
+                pin.S.push_back(get((size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size));
+                pin.kc.push_back(nullptr);
+                pin.vc.push_back(nullptr);
+            }
+        }
+        if (m->has_mtp) {
+            pin.conv.push_back(nullptr);
+            pin.S.push_back(nullptr);
+            pin.kc.push_back(get((size_t) g.n_head_kv * len * g.head_dim));
+            pin.vc.push_back(get((size_t) g.n_head_kv * len * g.head_dim));
+        }
+        pin.hlast = get((size_t) g.n_embd);
+        if (!ok) {
+            pin_release();
+            pin_off = true;
+            std::fprintf(stderr, "strata-q36: a pinned prefix of %lld tokens does not fit in the free VRAM: pin= is off "
+                         "for this engine from now on\n", (long long) len);
+            return false;
+        }
+        pin.cap = len;
+        std::fprintf(stderr, "strata-q36: pinned prefix: %lld tokens, %.1f MiB (the cache below the prefix and the "
+                     "recurrent state)\n", (long long) len, (double) bytes / (1 << 20));
+        return true;
+    }
+    void pin_release() {
+        CK(cudaStreamSynchronize(st));
+        for (size_t l = 0; l < pin.conv.size(); ++l) {
+            if (pin.conv[l]) cudaFree(pin.conv[l]);
+            if (pin.S[l]) cudaFree(pin.S[l]);
+            if (pin.kc[l]) cudaFree(pin.kc[l]);
+            if (pin.vc[l]) cudaFree(pin.vc[l]);
+        }
+        if (pin.hlast) cudaFree(pin.hlast);
+        pin.conv.clear(); pin.S.clear(); pin.kc.clear(); pin.vc.clear();
+        pin.hlast = nullptr;
+        pin.cap = 0;
+        pin.len = 0;
+        pin.rdelta = 0;
+        pin.live.clear();
+    }
+    /// Keep the state of session `src` after its first `len` tokens as the pinned prefix (the read stopped there).
+    bool pin_save(int src, const int32_t* toks, int64_t len) {
+        if (len <= 0 || len >= ctx) return false;
+        sess[(size_t) cur].pos = pos;
+        const Sess& a = sess[(size_t) src];
+        if (a.pos != len || !pin_alloc(len)) return false;
+        const auto& g = m->g;
+        const size_t C = (size_t) g.ssm_conv_channels;
+        const size_t spitch = (size_t) ctx * g.head_dim * 4, dpitch = (size_t) pin.cap * g.head_dim * 4;
+        for (size_t l = 0; l < a.conv.size(); ++l) {
+            if (a.conv[l]) {
+                CK(cudaMemcpyAsync(pin.conv[l], a.conv[l], C * (g.ssm_d_conv - 1) * 4, cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpyAsync(pin.S[l], a.S[l], (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4,
+                                   cudaMemcpyDeviceToDevice, st));
+            }
+            if (a.kc[l]) {
+                CK(cudaMemcpy2DAsync(pin.kc[l], dpitch, a.kc[l], spitch, (size_t) len * g.head_dim * 4,
+                                     (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpy2DAsync(pin.vc[l], dpitch, a.vc[l], spitch, (size_t) len * g.head_dim * 4,
+                                     (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
+            }
+        }
+        CK(cudaMemcpyAsync(pin.hlast, a.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
+        CK(cudaStreamSynchronize(st));
+        pin.len = len;
+        pin.rdelta = a.rdelta;
+        pin.live.assign(toks, toks + len);
+        return true;
+    }
+    /// The pinned prefix's length when its tokens are a proper start of `ids` and no picture starts inside them, else 0.
+    size_t pin_match(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs) const {
+        const size_t L = (size_t) pin.len;
+        if (L == 0 || L >= ids.size() || !std::equal(pin.live.begin(), pin.live.end(), ids.begin())) return 0;
+        for (const ImgKey& k : imgs)
+            if (k.cell < (int64_t) L) return 0;   // a picture inside the prefix: its rows are not in the checkpoint
+        return L;
+    }
+    /// Session dst starts again at the pinned prefix (its own state and its own tokens).
+    void pin_restore(int dst) {
+        sess[(size_t) cur].pos = pos;
+        Sess& b = sess[(size_t) dst];
+        const auto& g = m->g;
+        const size_t C = (size_t) g.ssm_conv_channels;
+        const size_t dpitch = (size_t) ctx * g.head_dim * 4, spitch = (size_t) pin.cap * g.head_dim * 4;
+        for (size_t l = 0; l < pin.conv.size(); ++l) {
+            if (pin.conv[l]) {
+                CK(cudaMemcpyAsync(b.conv[l], pin.conv[l], C * (g.ssm_d_conv - 1) * 4, cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpyAsync(b.S[l], pin.S[l], (size_t) g.ssm_v_heads * g.ssm_state_size * g.ssm_state_size * 4,
+                                   cudaMemcpyDeviceToDevice, st));
+            }
+            if (pin.kc[l]) {
+                CK(cudaMemcpy2DAsync(b.kc[l], dpitch, pin.kc[l], spitch, (size_t) pin.len * g.head_dim * 4,
+                                     (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
+                CK(cudaMemcpy2DAsync(b.vc[l], dpitch, pin.vc[l], spitch, (size_t) pin.len * g.head_dim * 4,
+                                     (size_t) g.n_head_kv, cudaMemcpyDeviceToDevice, st));
+            }
+        }
+        CK(cudaMemcpyAsync(b.hlast, pin.hlast, (size_t) g.n_embd * 4, cudaMemcpyDeviceToDevice, st));
+        CK(cudaStreamSynchronize(st));
+        b.pos = pin.len;
+        b.rdelta = pin.rdelta;
+        b.live = pin.live;
+        b.imgs.clear();
+        if (dst == cur) load_cur();
+    }
     int hybrid_swaps_after_prompt = 2048;
     /// the MTP seed rows of a prompt chunk: a buffer the block's own forward does not use (`moe_out`, [tmax][N])
     float* mtp_seed() { return moe_out; }
@@ -3439,6 +3591,10 @@ struct Serve {
         const long long max_new = std::strtoll(p, &p, 10);
         Sampling smp;
         std::vector<uint64_t> img_keys;
+        // pin=N: the first N prompt tokens are a shared prefix (the server's "strata_prefix"); ckpt=0: this request keeps
+        // no checkpoint at all (a one-shot call).  Both absent: the request is read and cached as before.
+        int64_t req_pin = 0;
+        bool req_ckpt = true;
         for (;;) {
             while (*p == ' ') ++p;
             const char* st0 = p;
@@ -3457,6 +3613,8 @@ struct Serve {
             else if (key == "penalty_freq") smp.freq = std::strtof(v, nullptr);
             else if (key == "penalty_present") smp.present = std::strtof(v, nullptr);
             else if (key == "seed") smp.seed = std::strtoull(v, nullptr, 10);
+            else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(v));
+            else if (key == "ckpt") req_ckpt = std::atoi(v) != 0;
             else if (key == "img_keys") {
                 const char* q = v;
                 img_keys.clear();
@@ -3520,6 +3678,15 @@ struct Serve {
                 reuse = best;
             }
         }
+        // ---- the pinned prefix: a request whose prompt starts with the checkpoint's tokens starts there (also for a
+        // ckpt=0 request: the checkpoint is not this request's, it is a prefix an earlier request declared)
+        if (!adm && E.prompt_cache > 0) {
+            const size_t pl = E.pin_match(ids, ir.imgs);
+            if (pl > reuse) {
+                E.pin_restore(s);
+                reuse = pl;
+            }
+        }
         E.select(s);
         if (reuse == 0) {
             E.reset();
@@ -3528,23 +3695,56 @@ struct Serve {
         }
         if (geni) E.set_images(ir.rows, ir.cell_row, ir.mrope, (int64_t) ids.size(), ir.delta);
         else E.clear_images();
+        // ---- pin=N: the state after N tokens is kept as the checkpoint.  The read stops there (the two parts are one
+        // prompt either way) so that the checkpoint is exactly that token; a later request that shares the prefix
+        // resumes from it above.  One pinned prefix at a time: a new pin replaces the old.
+        int64_t pin_at = 0;
+        if (req_pin > 0) {
+            if (!req_ckpt) std::fprintf(stderr, "strata-q36: pin=%lld ignored: ckpt=0 keeps no checkpoint\n", (long long) req_pin);
+            else if (E.prompt_cache < 1)
+                std::fprintf(stderr, "strata-q36: pin=%lld ignored: --prompt-cache 0 keeps no checkpoint\n", (long long) req_pin);
+            else if (adm) std::fprintf(stderr, "strata-q36: pin=%lld ignored: a batch request keeps no checkpoint\n", (long long) req_pin);
+            else if (!ir.imgs.empty())
+                std::fprintf(stderr, "strata-q36: pin=%lld ignored: a request with pictures keeps no checkpoint\n",
+                             (long long) req_pin);
+            else if (req_pin >= (int64_t) ids.size())
+                std::fprintf(stderr, "strata-q36: pin=%lld ignored: the prefix must be shorter than the prompt (%zu tokens)\n",
+                             (long long) req_pin, ids.size());
+            else if (req_pin > (int64_t) reuse) pin_at = req_pin;
+            // else: the state already holds the prefix (from the checkpoint or from its own read): nothing to keep
+        }
         const auto t0 = Clock::now();
         const int64_t fresh = (int64_t) (ids.size() - reuse);
         bool cancelled = false;
-        const int64_t got = E.process(ids.data() + reuse, fresh, [&](int64_t done) -> bool {
-            std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) fresh, ms_since(t0),
-                        (double) done / std::max(1e-9, ms_since(t0) / 1000.0));
+        int64_t seg = (int64_t) reuse;   // the tokens read before the current part (PP counts the whole read)
+        auto on_chunk = [&](int64_t done) -> bool {
+            const int64_t read = seg + done - (int64_t) reuse;   // tokens this request has read (PP's first field)
+            std::printf("PP %lld %lld %.0f %.1f\n", (long long) read, (long long) fresh, ms_since(t0),
+                        (double) read / std::max(1e-9, ms_since(t0) / 1000.0));
             std::fflush(stdout);
-            if (n_active > 0 && done < fresh) {
+            if (n_active > 0 && read < fresh) {
                 poll_control();
                 // the slots decoding go on between a read's chunks (the last chunk's
                 for (int w = 0; w < read_windows && n_active > 0; ++w) window();   // logits must stay for the first token)
             } else {
                 poll_control();
             }
-            if (stop.load() && done < fresh) { cancelled = true; return false; }
+            if (stop.load() && read < fresh) { cancelled = true; return false; }
             return true;
-        });
+        };
+        int64_t got = 0;
+        const int64_t part = pin_at > 0 ? pin_at - (int64_t) reuse : 0;
+        if (part > 0) {
+            got = E.process(ids.data() + reuse, part, on_chunk);
+            if (got == part && !cancelled) {   // the state holds exactly the pinned prefix: keep it before reading on
+                if (!E.pin_save(s, ids.data(), pin_at))
+                    std::fprintf(stderr, "strata-q36: pin=%lld: the checkpoint was not kept (see above)\n", (long long) pin_at);
+                seg = pin_at;
+                got += E.process(ids.data() + pin_at, fresh - part, on_chunk);
+            }
+        } else {
+            got = E.process(ids.data() + reuse, fresh, on_chunk);
+        }
         ss.live.insert(ss.live.end(), ids.begin() + (long) reuse, ids.begin() + (long) reuse + (long) got);
         ss.imgs.clear();
         bool cut = false;
@@ -3724,7 +3924,7 @@ int strata::qwen35::run(int argc, char** argv) {
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
     bool warm = true;
-    int expert_slots = 0, batch = 0, draft_vocab = -1;
+    int expert_slots = 0, batch = 0, draft_vocab = -1, prompt_cache = 1;
     bool serve_mode = false, graph = true, vision = false, batch_mtp = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -3766,6 +3966,7 @@ int strata::qwen35::run(int argc, char** argv) {
         else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
         else if (a == "--expert-slots") expert_slots = std::atoi(next().c_str());
         else if (a == "--hybrid-rows") hybrid_rows = std::atoi(next().c_str());
+        else if (a == "--prompt-cache") prompt_cache = std::max(0, std::atoi(next().c_str()));   // pin=N's checkpoint
         else if (serve_mode && a.rfind("--", 0) == 0) {
             // serve passes the config's args plus a few of its own: one this engine does not have is said and skipped
             // (with its value), not fatal
@@ -3867,6 +4068,11 @@ int strata::qwen35::run(int argc, char** argv) {
         }
     } report{E};
     E.reset();
+    E.prompt_cache = prompt_cache;
+    if (E.prompt_cache <= 0) std::fprintf(stderr, "strata-q36: --prompt-cache 0: pin= keeps no checkpoint\n");
+    else if (E.prompt_cache > 1)
+        std::fprintf(stderr, "strata-q36: --prompt-cache %d: this engine keeps one pinned prefix (the option is the count "
+                             "on the DeepSeek engine)\n", E.prompt_cache);
     E.mtp_d = m.has_mtp ? mtp_d : 0;
     if (draft_vocab < 0 && std::getenv("STRATA_Q36_DRAFT_VOCAB") != nullptr) draft_vocab = std::atoi(std::getenv("STRATA_Q36_DRAFT_VOCAB"));
     E.draft_n = std::max(0, draft_vocab);

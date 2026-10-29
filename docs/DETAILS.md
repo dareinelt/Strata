@@ -701,6 +701,9 @@ the engine (v2 `memory.max` and `memory.high`, v1 `memory.limit_in_bytes`, less 
 `--memory-limit-mib` cap. The startup line `strata generate: memory guard: limit X GiB (source: flag|cgroup|meminfo) ...` names
 the source. It covers parking and session files only, not the startup sizing of the arena, the resident budget or the Windows commit check.
 
+The Qwen3.6 engine (`strata-q36`) does not use these options: it keeps one pinned prefix in VRAM instead, made by a
+request's `pin=` and turned off by `--prompt-cache 0`. See [QWEN36.md](QWEN36.md#a-shared-prompt-prefix).
+
 Snapshots hold running state, checkpoints, used K/V pages and draft-layer K/V. They add host RAM, not VRAM. Oldest parked entries
 are evicted first. A new conversation that starts at a checkpoint inside a parked one (sub-agents that share a system prompt)
 restores that prefix and leaves the parked conversation in place (the log says "borrowed"). Oversized snapshots or host
