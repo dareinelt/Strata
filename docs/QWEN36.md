@@ -112,6 +112,37 @@ for bit. The chunk size changes the GEMM tiles the BLAS picks and with them the 
 the size of the llama.cpp CPU-against-HIP difference on the same file, not a quality loss. A prompt shorter than the
 chunk (every chat turn after the first) is one chunk either way.
 
+## A shared prompt prefix
+
+A conversation that starts with the same long system prompt reads those tokens again in every request. A request can
+say that the first N tokens of its prompt are such a prefix:
+
+```
+GEN 64 pin=2420 1234,5678,...
+```
+
+The engine then keeps the state after token N in a checkpoint of its own, and a later request whose prompt starts with
+the same N tokens starts there instead of reading them. Two lines report it: the engine's
+`strata serve: session 0: prompt 2512 tokens = 2420 reused + 92 read in T ms ...` and the `DONE` line's `reused`
+field, which the server hands out as `cached_tokens`.
+
+- The checkpoint is a second copy of the state: the GDN state, the cache's cells below the prefix and the last hidden
+  row. There is one, for one prefix at a time. A `pin=` with other tokens replaces it.
+- It is allocated when the first `pin=` request arrives, out of the VRAM the experts left, and the engine prints its
+  size in MiB then. It is smaller than a session: only the cells below the prefix, not the whole cache.
+- Nothing changes until a request carries `pin=`: the default path, the log and the text are the old ones. `ckpt=0` (the
+  server's one-shot request) keeps no checkpoint, and `--prompt-cache 0` turns the feature off.
+- A request with pictures keeps no checkpoint, and a prefix that ends inside a picture is not resumed from: a picture's
+  rows are not in the checkpoint.
+- If the checkpoint does not fit in the free VRAM, the engine says so once and goes on without it; the requests are read
+  as before. A full card is not an error.
+- The read of a `pin=` request stops at token N, so the checkpoint is exactly that token. The two parts are one prompt
+  either way and the second part starts from the state a single read reaches.
+
+> **Not measured yet.** This path has not been built or timed: it is unconfirmed static analysis. What is claimed is
+> that the second and later requests of a conversation skip the prefix; how much that saves is open until a card with
+> `sm_80` or newer has run it.
+
 ## Speed and exactness
 
 Every change on the decode path gives the old kernels' bits. `STRATA_Q36_VERIFY=1 strata ... --no-graph` runs the old
