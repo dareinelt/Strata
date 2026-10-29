@@ -8,6 +8,8 @@ the check of the real tokenizer against the ids llama.cpp (PR 30817 b72050d0) ma
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -583,6 +585,95 @@ class Api(ApiBase):
         req = {}
         svc.prepare([{"role": "system", "content": "s"}, {"role": "user", "content": "u"}], None, {}, 16, req=req)
         self.assertEqual(req, {})
+
+
+class AutoPin(unittest.TestCase):
+    """STRATA_AUTO_PIN: the system prompt an agent and its sub-agents share, kept as a checkpoint for every model
+    family and not only for DeepSeek-V4.1's.  Unset, each family keeps what it had."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = mini_tokenizer()
+
+    def env(self, **kv):
+        keys = ("STRATA_AUTO_PIN", "STRATA_DS4_AUTO_PIN")
+        saved = {k: os.environ.get(k) for k in keys}
+        for k in keys:
+            os.environ.pop(k, None)
+        for k, v in kv.items():
+            if v is not None:
+                os.environ[k] = v
+
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(restore)
+
+    def svc(self, family=None, args=None):
+        engine = MockEngine(self.tok, "ok")
+        if args:
+            engine.spawn = ("strata", list(args), None, None, None, False, None)
+        svc = Service(engine, self.tok,
+                      ChatTemplate(TEMPLATE if family == "deepseek41" else ROOT / "serve" / "chat_template.jinja"))
+        if family:
+            svc.set_family(family)
+        return svc
+
+    def prepare(self, svc, messages, **extra):
+        req = dict(extra)
+        ids, _, _ = svc.prepare(messages, None, {}, 16, req=req)
+        return req, ids
+
+    LONG = {"role": "system", "content": "You are an agent. " * 40}      # 680 bytes: over Service.AUTO_PIN_MIN
+    TASK = {"role": "user", "content": "task one"}
+
+    def test_the_switch_keeps_the_shared_start_for_any_family(self):
+        self.env(STRATA_AUTO_PIN="1")
+        req, ids = self.prepare(self.svc(), [self.LONG, self.TASK])
+        n = req["strata_prefix"]["tokens"]
+        self.assertTrue(0 < n < len(ids) - 1)
+        self.assertIn("You are an agent.", self.tok.decode(ids[:n]))
+        self.assertNotIn("task one", self.tok.decode(ids[:n]))
+
+    def test_a_shared_start_shorter_than_the_minimum_is_left_alone(self):
+        self.env(STRATA_AUTO_PIN="1")
+        req, _ = self.prepare(self.svc(), [{"role": "system", "content": "Be brief."}, self.TASK])
+        self.assertNotIn("strata_prefix", req)       # cheaper to read again than a checkpoint of it is to keep
+
+    def test_the_switch_off_overrides_deepseeks_own_default(self):
+        self.env(STRATA_AUTO_PIN="0", STRATA_DS4_AUTO_PIN="1")
+        req, _ = self.prepare(self.svc("deepseek41"), [{"role": "system", "content": "s"}, self.TASK])
+        self.assertNotIn("strata_prefix", req)
+
+    def test_unset_each_family_keeps_what_it_had(self):
+        self.env()                                   # neither variable: DeepSeek-V4.1 pins, the others do not
+        req, _ = self.prepare(self.svc("deepseek41"), [{"role": "system", "content": "s"}, self.TASK])
+        self.assertIn("strata_prefix", req)          # no size gate, as it was
+        req, _ = self.prepare(self.svc(), [self.LONG, self.TASK])
+        self.assertNotIn("strata_prefix", req)
+
+    def test_a_one_shot_request_pins_nothing(self):
+        self.env(STRATA_AUTO_PIN="1")
+        req, _ = self.prepare(self.svc(), [self.LONG, self.TASK], strata_checkpoint=False)
+        self.assertNotIn("strata_prefix", req)
+
+    def test_a_clients_own_prefix_is_never_dropped(self):
+        self.env(STRATA_AUTO_PIN="1")
+        req, _ = self.prepare(self.svc(), [{"role": "system", "content": "s"}, self.TASK],
+                              strata_prefix={"tokens": 7})
+        self.assertEqual(req["strata_prefix"], {"tokens": 7})
+
+    def test_the_pin_needs_three_checkpoints_and_says_so_once(self):
+        self.env(STRATA_AUTO_PIN="1")
+        svc = self.svc(args=["--prompt-cache", "1"])     # root, pin and one rotating checkpoint: a pin needs all three
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertNotIn("strata_prefix", self.prepare(svc, [self.LONG, self.TASK])[0])
+            self.assertNotIn("strata_prefix", self.prepare(svc, [self.LONG, self.TASK])[0])
+        self.assertEqual(out.getvalue().count("--prompt-cache"), 1)
 
 
 class SlotEnv(unittest.TestCase):

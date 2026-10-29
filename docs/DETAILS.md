@@ -679,6 +679,8 @@ checkpoint is used only when the prompt starts with exactly its tokens and pictu
 the end of the system prompt that every chat of a client shares, is kept for good, so a new chat that shares the prefix
 starts after it. A prompt of 2,048 tokens or more is also checkpointed at the end of its system prompt. Claude Code stamps its
 system prompt with a billing header that changes on every request; the server pins both stamps so the prompt stays the same.
+With `STRATA_AUTO_PIN=1` the server also pins the end of the system prompt itself, for every model family, so a client that
+sends the same long system prompt with every request resumes from that checkpoint.
 
 | Option | Effect |
 | --- | --- |
@@ -687,6 +689,7 @@ system prompt with a billing header that changes on every request; the server pi
 | `--prompt-cache-spread` (opt-in) | The checkpoint that leaves is the one whose removal leaves the smallest gap, so the kept points thin out geometrically back from the end. An agent that rewrites its history a few thousand tokens back then resumes near the edit instead of at the system prompt. Same RAM. |
 | `"strata_checkpoint": false` (per request) | A one-shot request that no later request continues saves no checkpoints and keeps no session. |
 | `"strata_prefix": {"messages": 1}` (per request, opt-in) | One long document, many questions. Marks where the document ends: `{"messages": 1}`, `{"message": 0, "chars": 210000}` or `{"tokens": 12345}`. The checkpoint at the boundary is pinned, so 20 questions cost one read of the document. One pinned prefix at a time per engine; needs `--prompt-cache 3` or more; a malformed field is a 400. See [RESEARCH_RUNS.md](RESEARCH_RUNS.md). |
+| `STRATA_AUTO_PIN=1` (opt-in, environment) | The same pin without a client asking for it, and for every model family: the messages before the first user turn (the system prompt, with the tools rendered into it) are pinned, so the next request behind the same start goes back to it instead of reading it again. Agents and their sub-agents share that start. The start must be 512 tokens or longer, and the engine needs `--prompt-cache 3` or more (the server says so once at the first request if it does not). A request's own `strata_prefix` wins, and `"strata_checkpoint": false` turns the pin off for that request. `STRATA_AUTO_PIN=0` turns it off for every family, DeepSeek-V4.1 included. Unset: DeepSeek-V4.1 pins (its `STRATA_DS4_AUTO_PIN=0` switches that off), the other families pin nothing. |
 | `--conversation-cache-mib N`, `--conversation-cache-slots N` | Park conversations in a bounded host-RAM cache so alternating requests (controller and worker histories, sub-agents) reuse their prompts. Without `--conversation-cache-mib` the budget is 40% of the RAM left above `--conversation-cache-min-free-mib` once the model is loaded, at most 8192 MiB in steps of 256, off when under 1024; the engine log says which. `0` turns it off. It preserves histories; it does not run requests at once. |
 | `--conversation-cache-min-tokens N` | Park only conversations of at least N tokens, so short side requests do not evict a long conversation. Default `0` (park all). |
 | `--conversation-cache-park-gain N` (opt-in) | Park a conversation again only after it advanced N tokens past the copy it would replace. |

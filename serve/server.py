@@ -831,6 +831,18 @@ def conversation_slots(engine) -> int | None:
     return slots if isinstance(slots, int) else None
 
 
+def prompt_cache_slots(engine) -> int:
+    """The engine's --prompt-cache: how many conversation checkpoints it keeps, known before it has started.  The
+    engine's own default is 6.  A pin (the shared start, a client's strata_prefix) needs three of them."""
+    args = engine.spawn[1] if hasattr(engine, "spawn") else []
+    if "--prompt-cache" in args[:-1]:
+        try:
+            return int(args[args.index("--prompt-cache") + 1])
+        except ValueError:
+            pass
+    return 6
+
+
 def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) -> dict:
     """#596: the Monitor's Conversation cache card: the parked conversations (the engine's opt-in
     --conversation-cache-mib: budget, slots, what its log says) and how much of the prompts the cache gave back."""
@@ -4047,6 +4059,7 @@ class Service:
         self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
                             tokenizer.encode("<|endoftext|>", parse_special=True))
         self.family = None                              # the model family ("deepseek41"): set_family() below
+        self.pin_note = False                           # the --prompt-cache note about the shared start was printed
         self.parser_cls = OutputParser                  # reads the model's output (reasoning, content, tool calls)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points
@@ -5081,22 +5094,49 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
-        if self.family == "deepseek41" and req is not None and req.get("strata_prefix") is None and not images and not ds_pics:
-            lead = self.deepseek_shared_start(messages)
-            if lead:
-                req["strata_prefix"] = {"messages": lead}
+        pin_min = self.auto_pin_min()                     # 0: this server keeps no shared start
+        pinned = 0                                        # the messages this server pinned (not a client's own prefix)
+        if (pin_min and req is not None and req.get("strata_prefix") is None and not images and not ds_pics
+                and req.get("strata_checkpoint") is not False):
+            pinned = self.shared_start(messages)
+            if pinned:
+                req["strata_prefix"] = {"messages": pinned}
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
+            if pinned and (req["strata_prefix"].get("tokens") or 0) < pin_min:
+                req.pop("strata_prefix")                  # a start this short is cheaper to read again than to keep
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
-    @staticmethod
-    def deepseek_shared_start(messages) -> int:
-        """DeepSeek-V4.1 only: how many leading messages are the system prompt (its tools are rendered with them).  An
-        agent and its sub-agents that work behind the same system prompt and tools share exactly this start, so the
-        engine keeps a checkpoint of its state there (pin=N): the next agent behind the same start goes back to it
-        instead of reading it again.  0: none (STRATA_DS4_AUTO_PIN=0, no system message, or nothing after it)."""
-        if os.environ.get("STRATA_DS4_AUTO_PIN", "1") == "0":
+    AUTO_PIN_MIN = 512        # tokens: below this, keeping a shared start (a ~118 MB checkpoint) costs more than it saves
+
+    def auto_pin_min(self) -> int:
+        """The shortest shared start this server keeps a checkpoint for, 0 when it keeps none.  `STRATA_AUTO_PIN=1`
+        asks for it for every model family and `STRATA_AUTO_PIN=0` for none; unset keeps what each family had:
+        DeepSeek-V4.1 pins the system prompt and tools its agents share since 0.1.x (`STRATA_DS4_AUTO_PIN=0` turns that
+        off), the other families keep nothing and send their system prompt again with every request."""
+        env = os.environ.get("STRATA_AUTO_PIN", "").strip()
+        if env:
+            want, least = env != "0", self.AUTO_PIN_MIN
+        else:
+            want = self.family == "deepseek41" and os.environ.get("STRATA_DS4_AUTO_PIN", "1") != "0"
+            least = 1                                     # as it was: no size gate
+        if not want:
             return 0
+        slots = prompt_cache_slots(self.engine)
+        if slots < 3:                                     # the engine's pin needs three checkpoints: root, pin, one more
+            if not self.pin_note:
+                self.pin_note = True
+                print(f"[strata] the shared start is not kept: the engine runs --prompt-cache {slots} and a pin needs "
+                      "3 or more", flush=True)
+            return 0
+        return least
+
+    @staticmethod
+    def shared_start(messages) -> int:
+        """How many leading messages are the prompt's shared start (a system prompt, its tools are rendered with it).
+        An agent and its sub-agents behind the same system prompt and tools share exactly this start, so the engine
+        keeps a checkpoint of its state there (pin=N): the next request behind the same start goes back to it instead
+        of reading it again.  0: none (no system message, or nothing after it)."""
         n = 0
         for m in messages:
             if isinstance(m, dict) and m.get("role") in ("system", "developer"):
