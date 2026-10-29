@@ -107,7 +107,8 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
 - Agents and sub-agents that take turns do not read their prompts again. The engine sets a conversation aside when another request takes the model (about 17 MB per 6.5K tokens) and takes it
   back when the next prompt continues it, also after a restart. Slots live in `ds4-slots` next to the run log, are capped at 2 GB
   (`STRATA_DS4_SLOT_GB`) and are removed after a week. The system prompt and tools shared by an agent
-  and its sub-agents are kept as a checkpoint too. `STRATA_DS4_SLOT_KEEP=0` and `STRATA_DS4_AUTO_PIN=0` turn this off.
+  and its sub-agents are kept as a checkpoint too. `STRATA_DS4_SLOT_KEEP=0` and `STRATA_DS4_AUTO_PIN=0` turn this off. The
+  same pin is available for the other model families: `STRATA_AUTO_PIN=1` ([DETAILS.md](DETAILS.md)).
 
 Pictures are on by default: the engine reads them with its own vision tower (319 MiB of graphics memory, loaded with the model; no separate
 picture reader). The server decodes each picture, brings it to a size the tower takes (both sides a multiple of 42, at most 1024 image
